@@ -3,11 +3,20 @@ import asyncio
 import json
 import traceback
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse  # 🔥 引入 StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 import logging
 import uuid
 from collections import defaultdict
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from routers.diary import router as diary_router
+
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,22 +30,28 @@ try:
 except ImportError as e:
     logger.error(f"[ERROR] 服务加载失败: {e}")
 
-
     # 降级处理
     async def get_fitness_advice(data):
         return "本地模拟：请注意重心稳定"
 
-
     async def get_video_analysis_advice(prompt):
         return "本地模拟：动作需要调整"
-
 
     async def get_analysis_service():
         raise RuntimeError("分析服务未加载")
 
+
 app = FastAPI(title="网球 AI 教练后端")
 
-# 全局配置 (原有的 WebSocket 配置)
+# 注册日记/语音相关接口
+app.include_router(diary_router)
+
+# 创建上传目录并暴露静态资源
+Path("uploads/audio").mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+
+# 全局配置
 ADVICE_COOLDOWN = 15.0
 ANGLE_CHANGE_THRESHOLD = 5
 last_advice_time = 0
@@ -53,6 +68,7 @@ async def startup_event():
         logger.info("[OK] 视频分析服务已初始化")
     except Exception as e:
         logger.warning(f"[WARN] 视频分析服务初始化失败: {e}")
+
 
 # ===== 任务存储（内存，重启清空） =====
 _task_items: dict = defaultdict(list)
@@ -87,7 +103,7 @@ async def analyze_video_submit(file: UploadFile = File(...)):
             _task_done[task_id] = True
             logger.info(f"[任务{task_id[:8]}] 完成，共 {len(_task_items[task_id])} 条结果")
 
-    asyncio.create_task(run_task())  # 后台异步执行，不阻塞返回
+    asyncio.create_task(run_task())
 
     return JSONResponse({"task_id": task_id})
 
@@ -102,14 +118,15 @@ async def analyze_video_poll(task_id: str, offset: int = 0):
         raise HTTPException(status_code=404, detail="task_id 不存在")
 
     items = _task_items[task_id]
-    new_items = items[offset:]  # 只返回新增的
+    new_items = items[offset:]
 
     return JSONResponse({
         "items": new_items,
         "done": _task_done[task_id],
         "total": len(items)
     })
-# 🔥 核心修改 3：将普通 POST 接口改造为 SSE 推送
+
+
 @app.post("/api/analyze_video")
 async def analyze_video(file: UploadFile = File(...)):
     """
@@ -123,23 +140,25 @@ async def analyze_video(file: UploadFile = File(...)):
 
         async def event_generator():
             try:
-                # 遍历底层服务源源不断 yield 出来的数据
                 async for chunk in service.analyze_video_stream(video_bytes):
-                    # 将字典转为 JSON，并按照 SSE 标准格式 (data: {JSON}\n\n) 推送
                     payload = json.dumps(chunk, ensure_ascii=False)
                     yield f"data: {payload}\n\n"
 
-                # 视频全部分析完毕后，推一个结束标志
-                finish_payload = json.dumps({"type": "finished", "message": "分析结束"}, ensure_ascii=False)
+                finish_payload = json.dumps(
+                    {"type": "finished", "message": "分析结束"},
+                    ensure_ascii=False
+                )
                 yield f"data: {finish_payload}\n\n"
 
             except Exception as e:
                 logger.error(f"[流式处理异常] {e}")
                 traceback.print_exc()
-                error_payload = json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+                error_payload = json.dumps(
+                    {"type": "error", "message": str(e)},
+                    ensure_ascii=False
+                )
                 yield f"data: {error_payload}\n\n"
 
-        # 返回 StreamingResponse，指定媒体类型为 SSE
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     except Exception as e:
@@ -162,7 +181,7 @@ async def analyze_video_json(file: UploadFile = File(...)):
                 "shot_type": "forehand",
                 "shot_type_cn": "正手",
                 "analysis": {...},
-                "coach_advice": "教练建议文本"  # ← 前端从这里读取
+                "coach_advice": "教练建议文本"
             }
         ],
         "summary": {...}
@@ -178,15 +197,20 @@ async def analyze_video_json(file: UploadFile = File(...)):
 
         async for chunk in service.analyze_video_stream(video_bytes):
             chunk_type = chunk.get("type")
+
             if chunk_type == "segment":
                 segment_data = chunk.get("data", {})
                 segments.append(segment_data)
-                # 调试日志 - 验证 coach_advice 是否存在
-                logger.info(f"[片段 {segment_data.get('segment_id')}] "
-                            f"类型={segment_data.get('shot_type_cn')}, "
-                            f"教练建议={'有' if segment_data.get('coach_advice') else '无'}")
+
+                logger.info(
+                    f"[片段 {segment_data.get('segment_id')}] "
+                    f"类型={segment_data.get('shot_type_cn')}, "
+                    f"教练建议={'有' if segment_data.get('coach_advice') else '无'}"
+                )
+
             elif chunk_type == "summary":
                 summary = chunk.get("data")
+
             elif chunk_type == "error":
                 error_msg = chunk.get("message", "视频分析失败")
                 logger.error(f"[分析错误] {error_msg}")
@@ -214,11 +238,13 @@ async def analyze_video_json(file: UploadFile = File(...)):
 @app.websocket("/ws/joints")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    实时姿态监控 WebSocket 接口（保留原有功能不变）
+    实时姿态监控 WebSocket 接口
     """
     global last_advice_time, cached_advice, last_angles, advice_source
+
     await websocket.accept()
     logger.info(f"[WebSocket] 客户端已连接: {websocket.client.host}")
+
     try:
         while True:
             try:
@@ -229,23 +255,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.warning(f"[WARN] 数据接收失败: {e}")
                 break
 
-            le, re = raw_data.get("left_elbow", 180), raw_data.get("right_elbow", 180)
-            lk, rk = raw_data.get("left_knee", 180), raw_data.get("right_knee", 180)
+            le = raw_data.get("left_elbow", 180)
+            re = raw_data.get("right_elbow", 180)
+            lk = raw_data.get("left_knee", 180)
+            rk = raw_data.get("right_knee", 180)
+
             now = time.time()
             current_tts = True
 
             knee_abnormal = (lk < 90 or rk < 90)
             cooldown_passed = (now - last_advice_time > ADVICE_COOLDOWN)
-            angle_changed = (abs(lk - last_angles["left_knee"]) > ANGLE_CHANGE_THRESHOLD or
-                             abs(rk - last_angles["right_knee"]) > ANGLE_CHANGE_THRESHOLD)
+            angle_changed = (
+                abs(lk - last_angles["left_knee"]) > ANGLE_CHANGE_THRESHOLD
+                or abs(rk - last_angles["right_knee"]) > ANGLE_CHANGE_THRESHOLD
+            )
 
             if cooldown_passed and (knee_abnormal or angle_changed):
                 real_advice = None
                 retry_count = 0
+
                 while retry_count < 4 and real_advice is None:
                     try:
                         async with AI_SEMAPHORE:
-                            real_advice = await asyncio.wait_for(get_fitness_advice(raw_data), timeout=45.0)
+                            real_advice = await asyncio.wait_for(
+                                get_fitness_advice(raw_data),
+                                timeout=45.0
+                            )
                     except asyncio.TimeoutError:
                         retry_count += 1
                     except Exception:
@@ -255,18 +290,28 @@ async def websocket_endpoint(websocket: WebSocket):
                     cached_advice = real_advice
                     current_tts = True
                     last_advice_time = now
-                    last_angles = {"left_knee": lk, "right_knee": rk}
+                    last_angles = {
+                        "left_knee": lk,
+                        "right_knee": rk
+                    }
                     advice_source = "豆包"
 
             response_payload = {
-                "left_elbow": le, "right_elbow": re, "left_knee": lk, "right_knee": rk,
-                "content": str(cached_advice), "tts": current_tts,
-                "source": advice_source, "timestamp": now
+                "left_elbow": le,
+                "right_elbow": re,
+                "left_knee": lk,
+                "right_knee": rk,
+                "content": str(cached_advice),
+                "tts": current_tts,
+                "source": advice_source,
+                "timestamp": now
             }
+
             try:
                 await websocket.send_json(response_payload)
             except WebSocketDisconnect:
                 break
+
     except WebSocketDisconnect:
         logger.info("[WebSocket] 连接断开")
     except Exception as e:
@@ -275,7 +320,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "网球 AI 教练"}
+    return {
+        "status": "healthy",
+        "service": "网球 AI 教练"
+    }
 
 
 if __name__ == "__main__":
